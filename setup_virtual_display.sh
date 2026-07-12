@@ -11,6 +11,10 @@ DRY_RUN=0
 ASSUME_YES=0
 SOURCE_EDID=""
 TARGET_PORT=""
+SESSION_CONFIG=""
+GREETER_USER=""
+GREETER_HOME=""
+GREETER_LABEL=""
 MODE="install"
 MODE_SET=0
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -34,13 +38,17 @@ Modes:
   --current             Show the virtual display mapping active in this boot, then exit
   --sunshine            Show Sunshine Display Id hints from recent service logs, then exit
   --status              Show installed files and managed bootloader entries, then exit
+  --fix-greeter-flicker Disable the forced virtual display at the login screen only, to fix
+                        idle greeter flicker on AMD with a high-bandwidth real monitor
 
 Options:
-  --edid PATH     Use an existing EDID binary instead of selecting a connected monitor
-  --port NAME     Use this disconnected connector, for example HDMI-A-1 or DP-2
-  --yes           Accept the default choices when a prompt is needed
-  --dry-run       Show what would change without writing files or running generators
-  -h, --help      Show this help
+  --edid PATH           Use an existing EDID binary instead of selecting a connected monitor
+  --port NAME           Use this disconnected connector, for example HDMI-A-1 or DP-2
+  --session-config PATH Session kwinoutputconfig.json to base the greeter config on
+                        (default: the invoking user's ~/.config/kwinoutputconfig.json)
+  --yes                 Accept the default choices when a prompt is needed
+  --dry-run             Show what would change without writing files or running generators
+  -h, --help            Show this help
 
 Notes:
   - Run this while the monitor you want to clone is connected and awake.
@@ -774,6 +782,171 @@ show_status() {
   (( found )) || log "  none found in supported config files"
 }
 
+detect_login_manager() {
+  local unit base
+  unit="$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)"
+  base="$(basename "${unit:-}")"
+
+  case "$base" in
+    plasmalogin.service)
+      GREETER_USER="plasmalogin"
+      GREETER_LABEL="plasma-login-manager"
+      ;;
+    sddm.service)
+      GREETER_USER="sddm"
+      GREETER_LABEL="SDDM"
+      ;;
+    *)
+      if getent passwd plasmalogin >/dev/null 2>&1; then
+        GREETER_USER="plasmalogin"
+        GREETER_LABEL="plasma-login-manager"
+      elif getent passwd sddm >/dev/null 2>&1; then
+        GREETER_USER="sddm"
+        GREETER_LABEL="SDDM"
+      else
+        die "Could not identify the login manager (expected plasma-login-manager or SDDM). Active unit: ${base:-none}."
+      fi
+      ;;
+  esac
+
+  GREETER_HOME="$(getent passwd "$GREETER_USER" | cut -d: -f6)"
+  [[ -n "$GREETER_HOME" ]] || GREETER_HOME="/var/lib/$GREETER_USER"
+}
+
+get_forced_ports() {
+  local cmdline words word port
+  [[ -r /proc/cmdline ]] || return 0
+
+  cmdline="$(cat /proc/cmdline)"
+  read -r -a words <<< "$cmdline"
+
+  for word in "${words[@]}"; do
+    if [[ "$word" == drm.edid_firmware=*":$FIRMWARE_RELATIVE_PATH" ]]; then
+      port="${word#drm.edid_firmware=}"
+      port="${port%%:*}"
+      printf '%s\n' "$port"
+    fi
+  done
+}
+
+fix_greeter_flicker() {
+  require_cmd python3
+  require_cmd getent
+  detect_login_manager
+
+  log "Sunshine greeter flicker fix"
+  log
+  log "Login manager: $GREETER_LABEL (user $GREETER_USER, home $GREETER_HOME)"
+
+  local ghost_ports=()
+  if [[ -n "$TARGET_PORT" ]]; then
+    ghost_ports=("$TARGET_PORT")
+  else
+    mapfile -t ghost_ports < <(get_forced_ports)
+  fi
+  (( ${#ghost_ports[@]} > 0 )) || die "No forced virtual display found in /proc/cmdline. Run --install and reboot first, or pass --port NAME."
+  log "Ghost connector(s) to disable at the greeter: ${ghost_ports[*]}"
+
+  local src="$SESSION_CONFIG"
+  if [[ -z "$src" ]]; then
+    local real_user real_home
+    real_user="${SUDO_USER:-$USER}"
+    real_home="$(getent passwd "$real_user" | cut -d: -f6)"
+    src="$real_home/.config/kwinoutputconfig.json"
+  fi
+  [[ -f "$src" ]] || die "Session KWin output config not found: $src
+Arrange your displays once in System Settings (with the ghost enabled), then rerun. Or pass --session-config PATH."
+  log "Session display config: $src"
+
+  local tmp counts changed applicable
+  tmp="$(mktemp)"
+
+  if ! counts="$(python3 - "$src" "$tmp" "${ghost_ports[@]}" <<'PY'
+import json, sys
+
+src, out = sys.argv[1], sys.argv[2]
+ghosts = set(sys.argv[3:])
+
+try:
+    with open(src) as f:
+        data = json.load(f)
+    outputs = next(o for o in data if o.get("name") == "outputs")["data"]
+    setups = next(o for o in data if o.get("name") == "setups")["data"]
+except Exception as exc:
+    sys.stderr.write("Could not parse kwinoutputconfig.json: %s\n" % exc)
+    sys.exit(2)
+
+ghost_idx = {i for i, o in enumerate(outputs) if o.get("connectorName") in ghosts}
+if not ghost_idx:
+    sys.stderr.write("Ghost connector(s) %s not present in the session config.\n" % ", ".join(sorted(ghosts)))
+    sys.exit(3)
+
+changed = applicable = 0
+for setup in setups:
+    outs = setup.get("outputs", [])
+    conns = {o.get("outputIndex") for o in outs}
+    if len(outs) > 1 and (ghost_idx & conns):
+        applicable += 1
+        for o in outs:
+            if o.get("outputIndex") in ghost_idx:
+                if o.get("enabled", True):
+                    o["enabled"] = False
+                    changed += 1
+            else:
+                o["priority"] = 1
+
+with open(out, "w") as f:
+    json.dump(data, f, indent=4)
+    f.write("\n")
+
+print("%d %d" % (changed, applicable))
+PY
+)"; then
+    rm -f "$tmp"
+    die "Failed to build the greeter config from $src (see message above)."
+  fi
+
+  read -r changed applicable <<< "$counts"
+
+  if (( applicable == 0 )); then
+    rm -f "$tmp"
+    log
+    log "No greeter layout enables the ghost alongside another display, so there is nothing to fix."
+    log "The login screen never lights two displays at once in this config."
+    return
+  fi
+  log "Disabled the ghost in $changed of $applicable multi-display greeter layout(s)."
+
+  local dest="$GREETER_HOME/.config/kwinoutputconfig.json"
+  local greeter_group
+  greeter_group="$(id -gn "$GREETER_USER" 2>/dev/null || printf '%s' "$GREETER_USER")"
+
+  if (( DRY_RUN )); then
+    log
+    log "[dry-run] would install greeter config to $dest (owner ${GREETER_USER}:${greeter_group}):"
+    sed 's/^/  /' "$tmp"
+    log "[dry-run] reboot afterward to apply."
+    rm -f "$tmp"
+    return
+  fi
+
+  if [[ -e "$dest" ]]; then
+    local backup="${dest}.bak.${TIMESTAMP}"
+    cp -a "$dest" "$backup"
+    log "Backed up existing greeter config to $backup"
+  fi
+
+  install -Dm644 -o "$GREETER_USER" -g "$greeter_group" "$tmp" "$dest"
+  chown "${GREETER_USER}:${greeter_group}" "$GREETER_HOME/.config"
+  rm -f "$tmp"
+
+  log
+  log "Installed ghost-disabled greeter config: $dest"
+  log "Reboot to apply. The login screen will use only your real display, while the ghost still"
+  log "comes up after login for Sunshine. Your session display config was not modified."
+  log "Rollback: rm $dest"
+}
+
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
@@ -795,6 +968,10 @@ parse_args() {
         set_mode "status"
         shift
         ;;
+      --fix-greeter-flicker)
+        set_mode "fix-greeter-flicker"
+        shift
+        ;;
       --current|--active|--mapped-port)
         set_mode "current"
         shift
@@ -811,6 +988,11 @@ parse_args() {
       --port)
         [[ $# -ge 2 ]] || die "--port requires a connector name"
         TARGET_PORT="$2"
+        shift 2
+        ;;
+      --session-config)
+        [[ $# -ge 2 ]] || die "--session-config requires a path"
+        SESSION_CONFIG="$2"
         shift 2
         ;;
       --yes)
@@ -839,7 +1021,7 @@ parse_args() {
 main() {
   parse_args "$@"
 
-  if (( EUID != 0 && DRY_RUN == 0 )) && [[ "$MODE" =~ ^(install|switch|uninstall)$ ]]; then
+  if (( EUID != 0 && DRY_RUN == 0 )) && [[ "$MODE" =~ ^(install|switch|uninstall|fix-greeter-flicker)$ ]]; then
     die "Run as root: sudo ./setup_virtual_display.sh"
   fi
 
@@ -871,6 +1053,9 @@ main() {
       ;;
     status)
       show_status
+      ;;
+    fix-greeter-flicker)
+      fix_greeter_flicker
       ;;
     *)
       die "Unsupported mode: $MODE"
