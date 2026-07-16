@@ -15,6 +15,7 @@ SESSION_CONFIG=""
 GREETER_USER=""
 GREETER_HOME=""
 GREETER_LABEL=""
+GREETER_UNIT=""
 MODE="install"
 MODE_SET=0
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -40,6 +41,9 @@ Modes:
   --status              Show installed files and managed bootloader entries, then exit
   --fix-greeter-flicker Disable the forced virtual display at the login screen only, to fix
                         idle greeter flicker on AMD with a high-bandwidth real monitor
+  --fix-greeter-blackscreen
+                        Install a bounded startup wait for the forced connector, to reduce a
+                        rare boot race where the login screen shows no usable output
 
 Options:
   --edid PATH           Use an existing EDID binary instead of selecting a connected monitor
@@ -791,18 +795,22 @@ detect_login_manager() {
     plasmalogin.service)
       GREETER_USER="plasmalogin"
       GREETER_LABEL="plasma-login-manager"
+      GREETER_UNIT="plasmalogin.service"
       ;;
     sddm.service)
       GREETER_USER="sddm"
       GREETER_LABEL="SDDM"
+      GREETER_UNIT="sddm.service"
       ;;
     *)
       if getent passwd plasmalogin >/dev/null 2>&1; then
         GREETER_USER="plasmalogin"
         GREETER_LABEL="plasma-login-manager"
+        GREETER_UNIT="plasmalogin.service"
       elif getent passwd sddm >/dev/null 2>&1; then
         GREETER_USER="sddm"
         GREETER_LABEL="SDDM"
+        GREETER_UNIT="sddm.service"
       else
         die "Could not identify the login manager (expected plasma-login-manager or SDDM). Active unit: ${base:-none}."
       fi
@@ -947,6 +955,82 @@ PY
   log "Rollback: rm $dest"
 }
 
+fix_greeter_blackscreen() {
+  detect_login_manager
+
+  log "Sunshine greeter black-screen mitigation"
+  log
+  log "Login manager: $GREETER_LABEL (unit $GREETER_UNIT)"
+
+  local ghost_ports=()
+  if [[ -n "$TARGET_PORT" ]]; then
+    ghost_ports=("$TARGET_PORT")
+  else
+    mapfile -t ghost_ports < <(get_forced_ports)
+  fi
+  (( ${#ghost_ports[@]} > 0 )) || die "No forced virtual display found in /proc/cmdline. Run --install and reboot first, or pass --port NAME."
+  log "Connector(s) to wait for at greeter start: ${ghost_ports[*]}"
+  log
+  log "This targets a rare amdgpu boot race (seen as 'REG_WAIT timeout ... optc401_disable_crtc'"
+  log "in the kernel log) where the forced connector isn't ready by the time the greeter starts,"
+  log "leaving a login screen with no usable output. The wait is capped at 8 seconds and never"
+  log "fails the boot, so it is safe to install even if the race does not recur."
+
+  local wait_script="/usr/local/bin/sunshine-ghost-wait-for-outputs.sh"
+  local wait_content
+  wait_content="$(cat <<'SCRIPT'
+#!/usr/bin/env bash
+# Installed by setup_virtual_display.sh --fix-greeter-blackscreen
+# Best-effort wait for forced DRM connectors to report "connected" before the
+# greeter starts. Capped at 8s total per connector; never blocks boot longer
+# than that, and never fails.
+TIMEOUT_TENTHS=80
+for port in "$@"; do
+  status_path=""
+  for p in /sys/class/drm/card*-"$port"/status; do
+    [[ -e "$p" ]] && status_path="$p" && break
+  done
+  [[ -n "$status_path" ]] || continue
+  n=0
+  while (( n < TIMEOUT_TENTHS )); do
+    [[ "$(cat "$status_path" 2>/dev/null)" == "connected" ]] && break
+    sleep 0.1
+    (( n++ ))
+  done
+done
+exit 0
+SCRIPT
+)"
+
+  local dropin_dir="/etc/systemd/system/${GREETER_UNIT}.d"
+  local dropin="$dropin_dir/99-sunshine-wait-for-outputs.conf"
+  local dropin_content
+  dropin_content="$(cat <<CONF
+[Service]
+ExecStartPre=-${wait_script} ${ghost_ports[*]}
+CONF
+)"
+
+  if (( DRY_RUN )); then
+    log
+    log "[dry-run] would install $wait_script (mode 755):"
+    sed 's/^/  /' <<< "$wait_content"
+    log "[dry-run] would install $dropin:"
+    sed 's/^/  /' <<< "$dropin_content"
+    log "[dry-run] would run: systemctl daemon-reload"
+    return
+  fi
+
+  write_file "$wait_script" 755 "$wait_content"
+  write_file "$dropin" 644 "$dropin_content"
+  systemctl daemon-reload
+
+  log
+  log "Installed $wait_script"
+  log "Installed $dropin"
+  log "Reboot to apply. Rollback: rm $dropin $wait_script && systemctl daemon-reload"
+}
+
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
@@ -970,6 +1054,10 @@ parse_args() {
         ;;
       --fix-greeter-flicker)
         set_mode "fix-greeter-flicker"
+        shift
+        ;;
+      --fix-greeter-blackscreen)
+        set_mode "fix-greeter-blackscreen"
         shift
         ;;
       --current|--active|--mapped-port)
@@ -1021,7 +1109,7 @@ parse_args() {
 main() {
   parse_args "$@"
 
-  if (( EUID != 0 && DRY_RUN == 0 )) && [[ "$MODE" =~ ^(install|switch|uninstall|fix-greeter-flicker)$ ]]; then
+  if (( EUID != 0 && DRY_RUN == 0 )) && [[ "$MODE" =~ ^(install|switch|uninstall|fix-greeter-flicker|fix-greeter-blackscreen)$ ]]; then
     die "Run as root: sudo ./setup_virtual_display.sh"
   fi
 
@@ -1056,6 +1144,9 @@ main() {
       ;;
     fix-greeter-flicker)
       fix_greeter_flicker
+      ;;
+    fix-greeter-blackscreen)
+      fix_greeter_blackscreen
       ;;
     *)
       die "Unsupported mode: $MODE"
