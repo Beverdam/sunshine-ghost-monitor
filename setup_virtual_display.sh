@@ -245,6 +245,21 @@ connector_status_summary() {
   printf '%s' "${summaries[*]}"
 }
 
+# Echo the connector name(s) this boot maps to our EDID, one per line.
+# Same parse as show_current_mapping, but returns data instead of logging it,
+# so callers can name the actual connector rather than a placeholder.
+active_mapped_ports() {
+  local words word port
+  [[ -r /proc/cmdline ]] || return 0
+  read -r -a words <<< "$(cat /proc/cmdline)"
+  for word in "${words[@]}"; do
+    if [[ "$word" == drm.edid_firmware=*":$FIRMWARE_RELATIVE_PATH" ]]; then
+      port="${word#drm.edid_firmware=}"
+      printf '%s\n' "${port%%:*}"
+    fi
+  done
+}
+
 show_current_mapping() {
   local cmdline words word port found=0
   local mapped_ports=()
@@ -289,13 +304,27 @@ show_current_mapping() {
   done
 }
 
+# Sunshine writes its own log file and does not necessarily log to the journal;
+# on a systemd --user install the interesting lines ("Mapped 'DP-1' to kmsgrab
+# monitor index 1") appear only here. Listed newest-first by preference.
+sunshine_log_files() {
+  local f
+  for f in \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/sunshine/sunshine.log" \
+    "$HOME/.config/sunshine/sunshine.log" \
+    /var/log/sunshine/sunshine.log \
+    /var/log/sunshine.log; do
+    [[ -r "$f" ]] && printf '%s\n' "$f"
+  done
+}
+
 print_matching_sunshine_logs() {
   local label="$1"
   shift
   local lines=()
 
   log "$label"
-  if ! command -v journalctl >/dev/null 2>&1; then
+  if [[ "$1" == journalctl ]] && ! command -v journalctl >/dev/null 2>&1; then
     log "  journalctl is not available on this system."
     return 1
   fi
@@ -353,9 +382,12 @@ version_ge() {
 version_from_logs() {
   local line
 
-  command -v journalctl >/dev/null 2>&1 || return 1
-
-  local -a sources=(
+  local -a sources=()
+  local f
+  while IFS= read -r f; do
+    sources+=("tail -n 5000 $f")
+  done < <(sunshine_log_files)
+  sources+=(
     "journalctl --user -u sunshine -b --no-pager"
     "journalctl -u sunshine -b --no-pager"
     "journalctl --user -u sunshine -n 2000 --no-pager"
@@ -555,31 +587,46 @@ show_sunshine_hints() {
   log "Sunshine Web UI path:"
   log "  Configuration -> Audio/Video -> Display Id"
   log
-  log_display_id_advice "$style" "the forced connector shown above"
+  local advice_port="the forced connector shown above"
+  local -a mapped=()
+  mapfile -t mapped < <(active_mapped_ports)
+  (( ${#mapped[@]} == 1 )) && advice_port="${mapped[0]}"
+  log_display_id_advice "$style" "$advice_port"
   log
   log "If logs say Couldn't find monitor [3], that numeric id is not valid for the current"
   log "KMS monitor list; reselect the display instead of reusing the old value."
   log
   log "Looking for display/output hints in Sunshine logs from this boot:"
 
-  if ! command -v journalctl >/dev/null 2>&1; then
-    log "  journalctl is not available on this system."
-    return
-  fi
+  local found=0 f
 
-  local found=0
-  if print_matching_sunshine_logs "User service logs: journalctl --user -u sunshine -b" journalctl --user -u sunshine -b --no-pager; then
-    found=1
-  fi
-  log
-  if print_matching_sunshine_logs "System service logs: journalctl -u sunshine -b" journalctl -u sunshine -b --no-pager; then
-    found=1
+  # Sunshine's own log file first: with a systemd --user install it is usually the
+  # only place the display lines appear, because Sunshine logs to file rather than
+  # to the journal.
+  while IFS= read -r f; do
+    if print_matching_sunshine_logs "Sunshine log file: $f" tail -n 5000 "$f"; then
+      found=1
+    fi
+    log
+  done < <(sunshine_log_files)
+
+  if command -v journalctl >/dev/null 2>&1; then
+    if print_matching_sunshine_logs "User service logs: journalctl --user -u sunshine -b" journalctl --user -u sunshine -b --no-pager; then
+      found=1
+    fi
+    log
+    if print_matching_sunshine_logs "System service logs: journalctl -u sunshine -b" journalctl -u sunshine -b --no-pager; then
+      found=1
+    fi
+  else
+    log "journalctl is not available on this system."
   fi
 
   log
   if (( ! found )); then
     log "No Sunshine display lines were found. Start or restart Sunshine, then run this again."
     log "You can also inspect manually:"
+    log "  ${XDG_CONFIG_HOME:-\$HOME/.config}/sunshine/sunshine.log"
     log "  journalctl --user -u sunshine -b"
     log "  journalctl -u sunshine -b"
   else
