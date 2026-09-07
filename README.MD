@@ -19,6 +19,7 @@ The script:
 - adds the EDID to initramfs with a mkinitcpio drop-in;
 - adds kernel parameters that force a disconnected GPU connector on;
 - regenerates the relevant boot entries where possible;
+- detects your Sunshine version and prints only the `Display Id` advice that applies to it;
 - provides commands to diagnose, show the active mapping, switch ports, uninstall, and check status.
 
 It does not download a generic EDID. Cloning your real display is safer because it preserves the modes your monitor already supports.
@@ -273,7 +274,7 @@ That same release also changed how KMS numeric display indices are computed, so 
 
 On Sunshine versions older than v2026.906.222525, connector names are not accepted and you must use Sunshine's own detected numeric display id instead — see [Older Sunshine versions: numeric display id](#older-sunshine-versions-numeric-display-id) below.
 
-You do not have to work out which of the two applies: the script detects your Sunshine version and prints only the advice that matches it. Detection tries, in order, your package manager (`pacman`, `dpkg`, `rpm`, `flatpak`), Sunshine's own log lines, and finally `sunshine --version`. If none of those work, it asks you, or prints both variants when it cannot ask. To skip detection entirely:
+You do not have to work out which of the two applies: the script detects your Sunshine version and prints only the advice that matches it. Detection tries, in order, your package manager (`pacman`, `dpkg`, `rpm`, `flatpak`), Sunshine's own log output, and finally `sunshine --version`. If none of those work, it asks you, or prints both variants when it cannot ask. To skip detection entirely:
 
 ```bash
 ./setup_virtual_display.sh --sunshine --sunshine-version 2026.906.222525
@@ -284,6 +285,17 @@ Use the helper mode to show the active DRM mapping and relevant Sunshine log lin
 ```bash
 ./setup_virtual_display.sh --sunshine
 ```
+
+It reads **Sunshine's own log file first**, then the journal:
+
+```text
+$XDG_CONFIG_HOME/sunshine/sunshine.log   (usually ~/.config/sunshine/sunshine.log)
+/var/log/sunshine/sunshine.log
+journalctl --user -u sunshine
+journalctl -u sunshine
+```
+
+This order matters: with a `systemd --user` install, Sunshine writes to its log file and the journal units stay empty, so looking only at `journalctl` finds nothing even while Sunshine is running normally.
 
 Equivalent aliases:
 
@@ -330,7 +342,11 @@ Couldn't find monitor [3]
 
 then `3` is not valid for the current KMS monitor list. This is also the typical symptom after upgrading to v2026.906.222525 with an old numeric `Display Id`; switch to the connector name.
 
-If the helper does not find display lines, start or restart Sunshine and run it again.
+If the helper does not find display lines, start or restart Sunshine and run it again. If it still finds nothing while Sunshine is clearly running, check the log file directly — that is where the KMS monitor list is written:
+
+```bash
+grep -E "Monitor [0-9]+ is|Mapped '" ~/.config/sunshine/sunshine.log | tail
+```
 
 ## What If You Plug A Real Monitor Into The Virtual Port?
 
