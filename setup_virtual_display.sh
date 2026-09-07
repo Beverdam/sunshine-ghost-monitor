@@ -492,6 +492,15 @@ ask_display_id_style() {
   done
 }
 
+# Run detection in the *calling* shell. sunshine_display_id_style() is normally
+# invoked through command substitution, and any SUNSHINE_VERSION it sets there is
+# lost with the subshell -- which made report_sunshine_version() claim the version
+# was undetectable even when pacman had just returned it.
+ensure_sunshine_version_detected() {
+  [[ -n "$SUNSHINE_VERSION" ]] && return 0
+  detect_sunshine_version >/dev/null 2>&1 || true
+}
+
 report_sunshine_version() {
   if [[ -n "$SUNSHINE_VERSION" ]]; then
     log "Detected Sunshine version: $SUNSHINE_VERSION (via $SUNSHINE_VERSION_SOURCE)"
@@ -533,6 +542,7 @@ show_sunshine_hints() {
   show_current_mapping
   log
 
+  ensure_sunshine_version_detected
   report_sunshine_version
   log
 
@@ -932,6 +942,7 @@ install_virtual_display() {
   log "Done. Reboot to apply the forced virtual display."
   log "After reboot, verify with: cat /sys/class/drm/card*-${TARGET_PORT}/status"
   log
+  ensure_sunshine_version_detected
   report_sunshine_version
   log_display_id_advice "$(sunshine_display_id_style)" "$TARGET_PORT"
   log "Run ./setup_virtual_display.sh --sunshine after rebooting for log-based hints."
