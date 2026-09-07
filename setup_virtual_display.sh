@@ -45,7 +45,11 @@ Options:
 Notes:
   - Run this while the monitor you want to clone is connected and awake.
   - This script does not download generic EDIDs; cloned monitor EDIDs are safer.
-  - After reboot, set Sunshine's Linux Display Id from Sunshine's own detected display logs.
+  - Since Sunshine v2026.906.222525, set Sunshine's Linux Display Id to the DRM connector
+    name (e.g. DP-1, HDMI-A-1) instead of a numeric index; that release changed how KMS
+    numeric display indices are computed, so old numeric Display Id values may now be wrong.
+  - On older Sunshine versions, take the numeric Display Id from Sunshine's own detected
+    display logs; use --sunshine for hints.
 USAGE
 }
 
@@ -310,10 +314,13 @@ show_sunshine_hints() {
   log "Sunshine Web UI path:"
   log "  Configuration -> Audio/Video -> Display Id"
   log
-  log "On Linux, set Display Id to Sunshine's detected display id, not necessarily the DRM connector name."
+  log "As of Sunshine v2026.906.222525, Display Id on Linux/KMS accepts the DRM connector name"
+  log "(e.g. DP-1, HDMI-A-1) directly, which is now the default and preferred value."
+  log "Prefer setting Display Id to the connector name shown above (the forced port, e.g. from --current or --diagnose)"
+  log "instead of a numeric index: this release changed how KMS numeric display indices are computed,"
+  log "so old numeric Display Id values (e.g. 1, 2) may now point at a different monitor or stop working."
   log "Sunshine's config/logs may still refer to this setting internally as output_name."
-  log "When Sunshine is using KMS, prefer lines like: Monitor 1 is DP-1."
-  log "In that example, DP-1's Display Id is 1. If logs say Couldn't find monitor [3], then 3 is wrong for the current monitor list."
+  log "If logs say Couldn't find monitor [3], reselect the display by connector name rather than reusing the old numeric index."
   log
   log "Looking for display/output hints in Sunshine logs from this boot:"
 
@@ -338,7 +345,8 @@ show_sunshine_hints() {
     log "  journalctl --user -u sunshine -b"
     log "  journalctl -u sunshine -b"
   else
-    log "Use the display id shown by Sunshine for the forced connector in Display Id."
+    log "On Sunshine v2026.906.222525 and newer, set Display Id to the forced connector's name."
+    log "On older versions, use the numeric display id Sunshine reports for that connector."
   fi
 }
 
@@ -696,7 +704,8 @@ install_virtual_display() {
   log
   log "Done. Reboot to apply the forced virtual display."
   log "After reboot, verify with: cat /sys/class/drm/card*-${TARGET_PORT}/status"
-  log "For Sunshine on Linux, use Sunshine's detected display id/logs for Display Id; do not assume it equals $TARGET_PORT."
+  log "Since Sunshine v2026.906.222525, set Sunshine's Display Id to the connector name ($TARGET_PORT) directly."
+  log "On older Sunshine versions, use Sunshine's detected numeric display id/logs instead; do not assume it equals $TARGET_PORT."
 }
 
 switch_virtual_port() {
