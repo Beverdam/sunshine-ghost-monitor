@@ -256,7 +256,15 @@ Go to:
 Configuration -> Audio/Video -> Display Id
 ```
 
-On Linux, do not assume Sunshine's display setting equals the connector name such as `HDMI-A-1`. Sunshine expects its own detected display id. In logs or config files, this may still appear internally as `output_name`.
+Since Sunshine [v2026.906.222525](https://github.com/LizardByte/Sunshine/releases/tag/v2026.906.222525), Linux display selection accepts the DRM connector name directly, and that is the recommended value. Set `Display Id` to the connector this script forces on, for example:
+
+```text
+HDMI-A-1
+```
+
+That same release also changed how KMS numeric display indices are computed, so **numeric `Display Id` values from an older Sunshine may now point at a different monitor**. If you are upgrading, reselect your display by connector name. In logs or config files, this setting may still appear internally as `output_name`.
+
+On Sunshine versions older than v2026.906.222525, connector names are not accepted and you must use Sunshine's own detected numeric display id instead — see [Older Sunshine versions: numeric display id](#older-sunshine-versions-numeric-display-id) below.
 
 Use the helper mode to show the active DRM mapping and relevant Sunshine log lines:
 
@@ -272,7 +280,9 @@ Equivalent aliases:
 ./setup_virtual_display.sh --output-name
 ```
 
-If the helper shows a Sunshine line like:
+### Older Sunshine versions: numeric display id
+
+On Sunshine releases before v2026.906.222525, `Display Id` does not accept connector names. If the helper shows a Sunshine line like:
 
 ```text
 Detected display: HDMI-A-1 (id: 3)
@@ -305,7 +315,7 @@ If Sunshine logs say:
 Couldn't find monitor [3]
 ```
 
-then `3` is not valid for the current KMS monitor list.
+then `3` is not valid for the current KMS monitor list. This is also the typical symptom after upgrading to v2026.906.222525 with an old numeric `Display Id`; switch to the connector name.
 
 If the helper does not find display lines, start or restart Sunshine and run it again.
 
