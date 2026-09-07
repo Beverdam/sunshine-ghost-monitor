@@ -51,6 +51,13 @@ sudo ./setup_virtual_display.sh --uninstall
 ./setup_virtual_display.sh --status
 ```
 
+Options:
+
+- `--edid PATH` uses an existing EDID binary instead of cloning a connected monitor.
+- `--port NAME` picks the disconnected connector to force on.
+- `--sunshine-version VER` skips Sunshine version detection and assumes `VER`, which decides whether the script tells you to use a connector name or a numeric `Display Id`.
+- `--yes` accepts default answers, `--dry-run` shows changes without writing them.
+
 Aliases:
 
 - `--install` is the default when no mode is passed.
@@ -265,6 +272,12 @@ HDMI-A-1
 That same release also changed how KMS numeric display indices are computed, so **numeric `Display Id` values from an older Sunshine may now point at a different monitor**. If you are upgrading, reselect your display by connector name. In logs or config files, this setting may still appear internally as `output_name`.
 
 On Sunshine versions older than v2026.906.222525, connector names are not accepted and you must use Sunshine's own detected numeric display id instead — see [Older Sunshine versions: numeric display id](#older-sunshine-versions-numeric-display-id) below.
+
+You do not have to work out which of the two applies: the script detects your Sunshine version and prints only the advice that matches it. Detection tries, in order, your package manager (`pacman`, `dpkg`, `rpm`, `flatpak`), Sunshine's own log lines, and finally `sunshine --version`. If none of those work, it asks you, or prints both variants when it cannot ask. To skip detection entirely:
+
+```bash
+./setup_virtual_display.sh --sunshine --sunshine-version 2026.906.222525
+```
 
 Use the helper mode to show the active DRM mapping and relevant Sunshine log lines:
 
