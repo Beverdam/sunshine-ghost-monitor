@@ -7,12 +7,18 @@ FIRMWARE_RELATIVE_PATH="edid/virtual-display.bin"
 MANAGED_BEGIN="# BEGIN Sunshine virtual display EDID"
 MANAGED_END="# END Sunshine virtual display EDID"
 
+# Sunshine v2026.906.222525 made DRM connector names the recommended Display Id on Linux
+# and changed how KMS numeric display indices are computed.
+CONNECTOR_NAME_VERSION="2026.906.222525"
+
 DRY_RUN=0
 ASSUME_YES=0
 SOURCE_EDID=""
 TARGET_PORT=""
 MODE="install"
 MODE_SET=0
+SUNSHINE_VERSION=""
+SUNSHINE_VERSION_SOURCE=""
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 
 usage() {
@@ -36,20 +42,20 @@ Modes:
   --status              Show installed files and managed bootloader entries, then exit
 
 Options:
-  --edid PATH     Use an existing EDID binary instead of selecting a connected monitor
-  --port NAME     Use this disconnected connector, for example HDMI-A-1 or DP-2
-  --yes           Accept the default choices when a prompt is needed
-  --dry-run       Show what would change without writing files or running generators
-  -h, --help      Show this help
+  --edid PATH             Use an existing EDID binary instead of selecting a connected monitor
+  --port NAME             Use this disconnected connector, for example HDMI-A-1 or DP-2
+  --sunshine-version VER  Assume this Sunshine version instead of detecting it
+  --yes                   Accept the default choices when a prompt is needed
+  --dry-run               Show what would change without writing files or running generators
+  -h, --help              Show this help
 
 Notes:
   - Run this while the monitor you want to clone is connected and awake.
   - This script does not download generic EDIDs; cloned monitor EDIDs are safer.
-  - Since Sunshine v2026.906.222525, set Sunshine's Linux Display Id to the DRM connector
-    name (e.g. DP-1, HDMI-A-1) instead of a numeric index; that release changed how KMS
-    numeric display indices are computed, so old numeric Display Id values may now be wrong.
-  - On older Sunshine versions, take the numeric Display Id from Sunshine's own detected
-    display logs; use --sunshine for hints.
+  - Sunshine's Display Id advice depends on your Sunshine version, which the script
+    detects from your package manager, Sunshine's logs, or 'sunshine --version'.
+    From v$CONNECTOR_NAME_VERSION on, Display Id is the DRM connector name (e.g. DP-1);
+    older releases need the numeric display id from Sunshine's own logs.
 USAGE
 }
 
@@ -305,22 +311,244 @@ print_matching_sunshine_logs() {
   return 0
 }
 
+normalize_version() {
+  local raw="$1"
+
+  raw="${raw#v}"
+  raw="${raw%%[-+~ ]*}"
+  raw="${raw##*:}"
+  printf '%s\n' "$raw"
+}
+
+# Returns 0 when version $1 is greater than or equal to version $2.
+version_ge() {
+  local a b
+  a="$(normalize_version "$1")"
+  b="$(normalize_version "$2")"
+
+  local -a av bv
+  IFS='.' read -r -a av <<< "$a"
+  IFS='.' read -r -a bv <<< "$b"
+
+  local len="${#av[@]}"
+  (( ${#bv[@]} > len )) && len="${#bv[@]}"
+
+  local i x y
+  for (( i = 0; i < len; i++ )); do
+    x="${av[i]:-0}"
+    y="${bv[i]:-0}"
+    x="${x//[^0-9]/}"
+    y="${y//[^0-9]/}"
+    [[ -n "$x" ]] || x="0"
+    [[ -n "$y" ]] || y="0"
+    x=$((10#$x))
+    y=$((10#$y))
+    (( x > y )) && return 0
+    (( x < y )) && return 1
+  done
+
+  return 0
+}
+
+version_from_logs() {
+  local line
+
+  command -v journalctl >/dev/null 2>&1 || return 1
+
+  local -a sources=(
+    "journalctl --user -u sunshine -b --no-pager"
+    "journalctl -u sunshine -b --no-pager"
+    "journalctl --user -u sunshine -n 2000 --no-pager"
+    "journalctl -u sunshine -n 2000 --no-pager"
+  )
+
+  local source
+  for source in "${sources[@]}"; do
+    line="$($source 2>/dev/null | grep -oE 'version: *[0-9][0-9.]*' | tail -n 1 || true)"
+    line="${line#version:}"
+    line="${line// /}"
+    if [[ -n "$line" ]]; then
+      printf '%s\n' "$line"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+detect_sunshine_version() {
+  local found=""
+
+  # Package managers first: they are cheap and have no side effects.
+  if command -v pacman >/dev/null 2>&1; then
+    found="$(pacman -Qi sunshine 2>/dev/null | awk -F': *' '/^Version/ {print $2; exit}' || true)"
+    if [[ -n "$found" ]]; then
+      SUNSHINE_VERSION="$(normalize_version "$found")"
+      SUNSHINE_VERSION_SOURCE="pacman"
+      return 0
+    fi
+  fi
+
+  if command -v dpkg-query >/dev/null 2>&1; then
+    found="$(dpkg-query -W -f='${Version}' sunshine 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+      SUNSHINE_VERSION="$(normalize_version "$found")"
+      SUNSHINE_VERSION_SOURCE="dpkg"
+      return 0
+    fi
+  fi
+
+  if command -v rpm >/dev/null 2>&1; then
+    found="$(rpm -q --qf '%{VERSION}' sunshine 2>/dev/null || true)"
+    if [[ -n "$found" && "$found" != *"not installed"* ]]; then
+      SUNSHINE_VERSION="$(normalize_version "$found")"
+      SUNSHINE_VERSION_SOURCE="rpm"
+      return 0
+    fi
+  fi
+
+  if command -v flatpak >/dev/null 2>&1; then
+    found="$(flatpak info dev.lizardbyte.app.Sunshine 2>/dev/null | awk -F': *' '/^ *Version/ {print $2; exit}' || true)"
+    if [[ -n "$found" ]]; then
+      SUNSHINE_VERSION="$(normalize_version "$found")"
+      SUNSHINE_VERSION_SOURCE="flatpak"
+      return 0
+    fi
+  fi
+
+  found="$(version_from_logs || true)"
+  if [[ -n "$found" ]]; then
+    SUNSHINE_VERSION="$(normalize_version "$found")"
+    SUNSHINE_VERSION_SOURCE="sunshine logs"
+    return 0
+  fi
+
+  # Last resort: ask the binary. Skipped as root because Sunshine initializes
+  # logging on startup and could leave root-owned files in the user's config.
+  if command -v sunshine >/dev/null 2>&1 && (( EUID != 0 )); then
+    found="$(sunshine --version 2>&1 | grep -oE 'version: *[0-9][0-9.]*' | head -n 1 || true)"
+    found="${found#version:}"
+    found="${found// /}"
+    if [[ -n "$found" ]]; then
+      SUNSHINE_VERSION="$(normalize_version "$found")"
+      SUNSHINE_VERSION_SOURCE="sunshine --version"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+# Prints "new", "old", or "unknown" for the Display Id style this Sunshine expects.
+sunshine_display_id_style() {
+  if [[ -z "$SUNSHINE_VERSION" ]]; then
+    detect_sunshine_version >/dev/null 2>&1 || true
+  fi
+
+  if [[ -n "$SUNSHINE_VERSION" ]]; then
+    if version_ge "$SUNSHINE_VERSION" "$CONNECTOR_NAME_VERSION"; then
+      printf 'new\n'
+    else
+      printf 'old\n'
+    fi
+    return
+  fi
+
+  printf 'unknown\n'
+}
+
+ask_display_id_style() {
+  local reply
+
+  if (( ASSUME_YES )); then
+    printf 'new\n'
+    return
+  fi
+
+  if [[ ! -t 0 ]]; then
+    printf 'unknown\n'
+    return
+  fi
+
+  while true; do
+    read -r -p "Is your Sunshine version $CONNECTOR_NAME_VERSION or newer? [Y/n/?]: " reply >&2 || {
+      printf 'unknown\n'
+      return
+    }
+    case "${reply:-y}" in
+      [Yy]*)
+        printf 'new\n'
+        return
+        ;;
+      [Nn]*)
+        printf 'old\n'
+        return
+        ;;
+      *)
+        printf 'unknown\n'
+        return
+        ;;
+    esac
+  done
+}
+
+report_sunshine_version() {
+  if [[ -n "$SUNSHINE_VERSION" ]]; then
+    log "Detected Sunshine version: $SUNSHINE_VERSION (via $SUNSHINE_VERSION_SOURCE)"
+  else
+    log "Sunshine version could not be detected automatically."
+    log "Override it with --sunshine-version X.Y.Z if you know it."
+  fi
+}
+
+log_display_id_advice() {
+  local style="$1"
+  local port="${2:-the forced connector}"
+
+  case "$style" in
+    new)
+      log "Your Sunshine is $CONNECTOR_NAME_VERSION or newer, so set Display Id to the connector name:"
+      log "  $port"
+      log "Numeric Display Id values from an older Sunshine may now select a different monitor,"
+      log "because that release changed how KMS numeric display indices are computed."
+      ;;
+    old)
+      log "Your Sunshine is older than $CONNECTOR_NAME_VERSION, so connector names are not accepted."
+      log "Set Display Id to the numeric display id Sunshine reports for $port in its logs."
+      log "With KMS, look for lines like: Monitor 1 is DP-1. There, DP-1's Display Id is 1."
+      ;;
+    *)
+      log "Sunshine version is unknown, so both styles are listed:"
+      log "  $CONNECTOR_NAME_VERSION and newer: set Display Id to the connector name ($port)."
+      log "  Older releases: set Display Id to the numeric display id from Sunshine's logs,"
+      log "    for example 1 for a log line reading: Monitor 1 is DP-1."
+      ;;
+  esac
+  log "Sunshine's config/logs may still refer to this setting internally as output_name."
+}
+
 show_sunshine_hints() {
   log "Sunshine Display Id helper"
   log
   show_current_mapping
   log
 
+  report_sunshine_version
+  log
+
+  local style
+  style="$(sunshine_display_id_style)"
+  if [[ "$style" == "unknown" ]]; then
+    style="$(ask_display_id_style)"
+  fi
+
   log "Sunshine Web UI path:"
   log "  Configuration -> Audio/Video -> Display Id"
   log
-  log "As of Sunshine v2026.906.222525, Display Id on Linux/KMS accepts the DRM connector name"
-  log "(e.g. DP-1, HDMI-A-1) directly, which is now the default and preferred value."
-  log "Prefer setting Display Id to the connector name shown above (the forced port, e.g. from --current or --diagnose)"
-  log "instead of a numeric index: this release changed how KMS numeric display indices are computed,"
-  log "so old numeric Display Id values (e.g. 1, 2) may now point at a different monitor or stop working."
-  log "Sunshine's config/logs may still refer to this setting internally as output_name."
-  log "If logs say Couldn't find monitor [3], reselect the display by connector name rather than reusing the old numeric index."
+  log_display_id_advice "$style" "the forced connector shown above"
+  log
+  log "If logs say Couldn't find monitor [3], that numeric id is not valid for the current"
+  log "KMS monitor list; reselect the display instead of reusing the old value."
   log
   log "Looking for display/output hints in Sunshine logs from this boot:"
 
@@ -345,8 +573,7 @@ show_sunshine_hints() {
     log "  journalctl --user -u sunshine -b"
     log "  journalctl -u sunshine -b"
   else
-    log "On Sunshine v2026.906.222525 and newer, set Display Id to the forced connector's name."
-    log "On older versions, use the numeric display id Sunshine reports for that connector."
+    log "Use the value described above for Display Id."
   fi
 }
 
@@ -704,8 +931,10 @@ install_virtual_display() {
   log
   log "Done. Reboot to apply the forced virtual display."
   log "After reboot, verify with: cat /sys/class/drm/card*-${TARGET_PORT}/status"
-  log "Since Sunshine v2026.906.222525, set Sunshine's Display Id to the connector name ($TARGET_PORT) directly."
-  log "On older Sunshine versions, use Sunshine's detected numeric display id/logs instead; do not assume it equals $TARGET_PORT."
+  log
+  report_sunshine_version
+  log_display_id_advice "$(sunshine_display_id_style)" "$TARGET_PORT"
+  log "Run ./setup_virtual_display.sh --sunshine after rebooting for log-based hints."
 }
 
 switch_virtual_port() {
@@ -820,6 +1049,13 @@ parse_args() {
       --port)
         [[ $# -ge 2 ]] || die "--port requires a connector name"
         TARGET_PORT="$2"
+        shift 2
+        ;;
+      --sunshine-version)
+        [[ $# -ge 2 ]] || die "--sunshine-version requires a version, for example $CONNECTOR_NAME_VERSION"
+        SUNSHINE_VERSION="$(normalize_version "$2")"
+        [[ "$SUNSHINE_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]] || die "Not a recognizable version: $2"
+        SUNSHINE_VERSION_SOURCE="--sunshine-version"
         shift 2
         ;;
       --yes)
